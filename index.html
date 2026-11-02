@@ -72,10 +72,23 @@
     ]
   };
 
-  // Local: ws://host:8080 | Em HTTPS: wss://host/ws (proxy reverso -> :8080)
-  var WS_URL = (location.protocol === 'https:')
-    ? 'wss://' + location.host + '/ws'
-    : 'ws://' + location.hostname + ':8080';
+  var params = new URLSearchParams(location.search);
+
+  // Servidor de sinalização. Prioridade:
+  // 1) ?ws=meu-tunel.trycloudflare.com (aceita com ou sem https:// / wss://)
+  // 2) Local: ws://host:8080 | Em HTTPS sem ?ws=: wss://host/ws (proxy reverso -> :8080)
+  function wsUrl() {
+    var w = params.get('ws');
+    if (w) {
+      w = w.replace(/^https:\/\//i, 'wss://').replace(/^http:\/\//i, 'ws://');
+      if (!/^wss?:\/\//i.test(w)) w = 'wss://' + w;
+      return w;
+    }
+    return (location.protocol === 'https:')
+      ? 'wss://' + location.host + '/ws'
+      : 'ws://' + location.hostname + ':8080';
+  }
+  var WS_URL = wsUrl();
 
   var QUALITY = {
     '720p60':  { w: 1280, h: 720,  fps: 60, bitrate: 4000000, hint: 'motion' },
@@ -88,7 +101,6 @@
   var ws = null, role = null, stream = null;
   var peers = {}; // apresentador: idDoEspectador -> pc | espectador: peers.presenter
 
-  var params = new URLSearchParams(location.search);
   $('room').value = params.get('room') || Math.random().toString(36).slice(2, 8);
 
   function room() { return $('room').value.replace(/[^A-Za-z0-9_-]/g, ''); }
@@ -282,6 +294,7 @@
   $('btnStop').onclick = stopAll;
   $('btnCopy').onclick = function () {
     var link = location.origin + location.pathname + '?room=' + encodeURIComponent(room());
+    if (params.get('ws')) link += '&ws=' + encodeURIComponent(params.get('ws'));
     if (navigator.clipboard) navigator.clipboard.writeText(link);
     status('Link copiado');
   };
