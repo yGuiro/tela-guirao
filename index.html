@@ -24,8 +24,9 @@
   button:disabled { opacity: .5; cursor: default; }
   #room { width: 120px; }
   #status { margin-left: auto; font-size: 13px; opacity: .85; }
-  main { flex: 1; display: flex; align-items: center; justify-content: center; min-height: 0; }
-  video { max-width: 100%; max-height: 100%; background: #000; }
+  #stats { font-size: 13px; opacity: .85; font-variant-numeric: tabular-nums; }
+  main { flex: 1; min-height: 0; }
+  video { width: 100%; height: 100%; object-fit: contain; background: #000; }
 </style>
 </head>
 <body>
@@ -37,6 +38,13 @@
       <option value="720p60">720p 60fps</option>
       <option value="1080p30">1080p 30fps (texto nítido)</option>
       <option value="1080p60" selected>1080p 60fps</option>
+      <option value="1440p60">1440p 60fps (alto upload)</option>
+    </select>
+  </label>
+  <label>Prioridade
+    <select id="priority">
+      <option value="detail" selected>Nitidez (mantém resolução)</option>
+      <option value="motion">Fluidez (mantém fps)</option>
     </select>
   </label>
   <label>Codec
@@ -53,6 +61,7 @@
   <button id="btnCopy">Copiar link</button>
   <button id="btnStop" disabled>Sair</button>
   <span id="status">Desconectado</span>
+  <span id="stats"></span>
 </header>
 
 <main>
@@ -90,10 +99,12 @@
   }
   var WS_URL = wsUrl();
 
+  // bitrate = máximo POR ESPECTADOR (com 5 espectadores, multiplique por 5 no upload)
   var QUALITY = {
-    '720p60':  { w: 1280, h: 720,  fps: 60, bitrate: 4000000, hint: 'motion' },
-    '1080p30': { w: 1920, h: 1080, fps: 30, bitrate: 5000000, hint: 'detail' },
-    '1080p60': { w: 1920, h: 1080, fps: 60, bitrate: 6000000, hint: 'motion' }
+    '720p60':  { w: 1280, h: 720,  fps: 60, bitrate: 4000000 },
+    '1080p30': { w: 1920, h: 1080, fps: 30, bitrate: 6000000 },
+    '1080p60': { w: 1920, h: 1080, fps: 60, bitrate: 8000000 },
+    '1440p60': { w: 2560, h: 1440, fps: 60, bitrate: 14000000 }
   };
 
   // ---- Estado ------------------------------------------------------------
@@ -175,13 +186,14 @@
     } catch (e) { status('Compartilhamento cancelado'); return; }
 
     var vt = stream.getVideoTracks()[0];
-    vt.contentHint = q.hint;                 // 'motion' = fluidez | 'detail' = nitidez
+    vt.contentHint = $('priority').value;    // 'detail' = mantém resolução | 'motion' = mantém fps
     vt.onended = stopAll;                    // usuário clicou em "Parar compartilhamento"
 
     var v = $('video');
     v.srcObject = stream; v.muted = true;    // pré-visualização sem eco
     role = 'presenter';
     setRunning(true);
+    startStats();
     connect(function () { send({ type: 'join', room: room(), role: 'presenter' }); });
   }
 
@@ -244,6 +256,7 @@
   function startViewer() {
     role = 'viewer';
     setRunning(true);
+    startStats();
     $('video').muted = false;
     connect(function () { send({ type: 'join', room: room(), role: 'viewer' }); });
   }
@@ -277,6 +290,43 @@
     }
   }
 
+  // ---- Estatísticas (diagnóstico de qualidade) -------------------------------
+  var statsTimer = null, lastBytes = 0, lastTs = 0;
+
+  function showStats(s, bytes, extra) {
+    var kbps = lastTs ? Math.round((bytes - lastBytes) * 8 / (s.timestamp - lastTs)) : 0;
+    if (kbps < 0) kbps = 0;
+    lastBytes = bytes; lastTs = s.timestamp;
+    $('stats').textContent = (s.frameWidth || 0) + '×' + (s.frameHeight || 0) +
+      ' · ' + Math.round(s.framesPerSecond || 0) + ' fps · ' +
+      (kbps / 1000).toFixed(1) + ' Mbps' + extra;
+  }
+
+  function startStats() {
+    stopStats();
+    statsTimer = setInterval(async function () {
+      var pc = (role === 'viewer') ? peers.presenter : peers[Object.keys(peers)[0]];
+      if (!pc) { $('stats').textContent = ''; lastTs = 0; return; }
+      var rep;
+      try { rep = await pc.getStats(); } catch (e) { return; }
+      rep.forEach(function (s) {
+        if (s.kind !== 'video') return;
+        if (role === 'viewer' && s.type === 'inbound-rtp') {
+          showStats(s, s.bytesReceived, '');
+        } else if (role === 'presenter' && s.type === 'outbound-rtp') {
+          // qualityLimitationReason: none | bandwidth (rede) | cpu (processador)
+          showStats(s, s.bytesSent, ' · limite: ' + (s.qualityLimitationReason || 'none'));
+        }
+      });
+    }, 1000);
+  }
+
+  function stopStats() {
+    if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
+    lastBytes = 0; lastTs = 0;
+    $('stats').textContent = '';
+  }
+
   // ---- Encerrar -------------------------------------------------------------
   function stopAll() {
     Object.keys(peers).forEach(closePeer);
@@ -284,6 +334,7 @@
     if (ws) { try { ws.close(); } catch (e) {} ws = null; }
     $('video').srcObject = null;
     role = null;
+    stopStats();
     setRunning(false);
     status('Desconectado');
   }
