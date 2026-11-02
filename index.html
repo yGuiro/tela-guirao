@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sala de Tela</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; height: 100vh; display: flex; flex-direction: column;
+    background: #0f0f12; color: #e8e8ee;
+    font-family: system-ui, "Segoe UI", Arial, sans-serif;
+  }
+  header {
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    padding: 10px 14px; background: #1a1a20; border-bottom: 1px solid #2a2a33;
+  }
+  input, select, button {
+    background: #25252d; color: inherit; border: 1px solid #3a3a46;
+    border-radius: 6px; padding: 7px 10px; font: inherit;
+  }
+  button { cursor: pointer; }
+  button.primary { background: #5865f2; border-color: #5865f2; }
+  button:disabled { opacity: .5; cursor: default; }
+  #room { width: 120px; }
+  #status { margin-left: auto; font-size: 13px; opacity: .85; }
+  main { flex: 1; display: flex; align-items: center; justify-content: center; min-height: 0; }
+  video { max-width: 100%; max-height: 100%; background: #000; }
+</style>
+</head>
+<body>
+
+<header>
+  <label>Sala <input id="room" maxlength="32"></label>
+  <label>Qualidade
+    <select id="quality">
+      <option value="720p60">720p 60fps</option>
+      <option value="1080p30">1080p 30fps (texto nítido)</option>
+      <option value="1080p60" selected>1080p 60fps</option>
+    </select>
+  </label>
+  <label>Codec
+    <select id="codec">
+      <option value="auto">Automático</option>
+      <option value="H264">H.264</option>
+      <option value="VP9">VP9</option>
+      <option value="AV1">AV1</option>
+      <option value="VP8">VP8</option>
+    </select>
+  </label>
+  <button id="btnShare" class="primary">Compartilhar tela</button>
+  <button id="btnWatch">Assistir</button>
+  <button id="btnCopy">Copiar link</button>
+  <button id="btnStop" disabled>Sair</button>
+  <span id="status">Desconectado</span>
+</header>
+
+<main>
+  <video id="video" autoplay playsinline controls></video>
+</main>
+
+<script>
+(function () {
+  'use strict';
+
+  // ---- Configuração ----------------------------------------------------
+  var ICE = {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' }
+      // Para usuários atrás de NAT restritivo, adicione um TURN (coturn):
+      // , { urls: 'turn:SEU_SERVIDOR:3478', username: 'usuario', credential: 'senha' }
+    ]
+  };
+
+  // Local: ws://host:8080 | Em HTTPS: wss://host/ws (proxy reverso -> :8080)
+  var WS_URL = (location.protocol === 'https:')
+    ? 'wss://' + location.host + '/ws'
+    : 'ws://' + location.hostname + ':8080';
+
+  var QUALITY = {
+    '720p60':  { w: 1280, h: 720,  fps: 60, bitrate: 4000000, hint: 'motion' },
+    '1080p30': { w: 1920, h: 1080, fps: 30, bitrate: 5000000, hint: 'detail' },
+    '1080p60': { w: 1920, h: 1080, fps: 60, bitrate: 6000000, hint: 'motion' }
+  };
+
+  // ---- Estado ------------------------------------------------------------
+  var $ = function (id) { return document.getElementById(id); };
+  var ws = null, role = null, stream = null;
+  var peers = {}; // apresentador: idDoEspectador -> pc | espectador: peers.presenter
+
+  var params = new URLSearchParams(location.search);
+  $('room').value = params.get('room') || Math.random().toString(36).slice(2, 8);
+
+  function room() { return $('room').value.replace(/[^A-Za-z0-9_-]/g, ''); }
+  function status(t) { $('status').textContent = t; }
+  function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+
+  function setRunning(on) {
+    $('btnShare').disabled = on;
+    $('btnWatch').disabled = on;
+    $('btnStop').disabled = !on;
+    $('room').disabled = on;
+  }
+
+  // ---- WebSocket -----------------------------------------------------------
+  function connect(onOpen) {
+    ws = new WebSocket(WS_URL);
+    ws.onopen = onOpen;
+    ws.onmessage = function (e) { handle(JSON.parse(e.data)); };
+    ws.onclose = function () { status('Desconectado do servidor'); };
+    ws.onerror = function () { status('Erro ao conectar em ' + WS_URL); };
+  }
+
+  function handle(m) {
+    switch (m.type) {
+      case 'error':
+        alert(m.reason); stopAll(); break;
+      case 'joined':
+        if (role === 'presenter') status('Transmitindo na sala "' + room() + '"');
+        else status(m.presenterOnline ? 'Conectando…' : 'Aguardando o apresentador…');
+        break;
+      case 'viewers':       // apresentador: espectadores que já estavam na sala
+        m.ids.forEach(callViewer); break;
+      case 'viewer-joined':
+        callViewer(m.id); break;
+      case 'viewer-left':
+        closePeer(m.id); break;
+      case 'presenter-left':
+        closePeer('presenter'); $('video').srcObject = null;
+        status('O apresentador saiu. Aguardando…'); break;
+      case 'signal':
+        if (role === 'presenter') presenterSignal(m.from, m.data);
+        else viewerSignal(m.data);
+        break;
+    }
+  }
+
+  // ---- Utilitários de peer -------------------------------------------------
+  function closePeer(key) {
+    if (peers[key]) { try { peers[key].close(); } catch (e) {} delete peers[key]; }
+  }
+
+  async function setRemote(pc, sdp) {
+    await pc.setRemoteDescription(sdp);
+    var pend = pc._pend || [];
+    pc._pend = [];
+    for (var i = 0; i < pend.length; i++) { await pc.addIceCandidate(pend[i]).catch(console.warn); }
+  }
+
+  function addCandidate(pc, cand) {
+    if (pc.remoteDescription) pc.addIceCandidate(cand).catch(console.warn);
+    else (pc._pend = pc._pend || []).push(cand);
+  }
+
+  // ---- APRESENTADOR ---------------------------------------------------------
+  async function startPresenter() {
+    var q = QUALITY[$('quality').value];
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { width: { ideal: q.w }, height: { ideal: q.h }, frameRate: { ideal: q.fps } },
+        audio: true // áudio da aba/sistema (Chrome/Edge)
+      });
+    } catch (e) { status('Compartilhamento cancelado'); return; }
+
+    var vt = stream.getVideoTracks()[0];
+    vt.contentHint = q.hint;                 // 'motion' = fluidez | 'detail' = nitidez
+    vt.onended = stopAll;                    // usuário clicou em "Parar compartilhamento"
+
+    var v = $('video');
+    v.srcObject = stream; v.muted = true;    // pré-visualização sem eco
+    role = 'presenter';
+    setRunning(true);
+    connect(function () { send({ type: 'join', room: room(), role: 'presenter' }); });
+  }
+
+  function applyCodec(pc) {
+    var pref = $('codec').value;
+    if (pref === 'auto' || !window.RTCRtpSender || !RTCRtpSender.getCapabilities) return;
+    var caps = RTCRtpSender.getCapabilities('video');
+    if (!caps) return;
+    var wanted = caps.codecs.filter(function (c) { return c.mimeType.toLowerCase() === 'video/' + pref.toLowerCase(); });
+    if (!wanted.length) return;
+    var rest = caps.codecs.filter(function (c) { return wanted.indexOf(c) === -1; });
+    pc.getTransceivers().forEach(function (t) {
+      if (t.sender.track && t.sender.track.kind === 'video' && t.setCodecPreferences) {
+        t.setCodecPreferences(wanted.concat(rest));
+      }
+    });
+  }
+
+  function tuneSenders(pc) {
+    var q = QUALITY[$('quality').value];
+    pc.getSenders().forEach(function (s) {
+      if (!s.track || s.track.kind !== 'video') return;
+      var p = s.getParameters();
+      if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+      p.encodings[0].maxBitrate = q.bitrate;
+      p.encodings[0].maxFramerate = q.fps;
+      s.setParameters(p).catch(console.warn);
+    });
+  }
+
+  async function callViewer(id) {
+    closePeer(id);
+    var pc = new RTCPeerConnection(ICE);
+    peers[id] = pc;
+
+    stream.getTracks().forEach(function (t) { pc.addTrack(t, stream); });
+    applyCodec(pc);
+
+    pc.onicecandidate = function (e) {
+      if (e.candidate) send({ type: 'signal', to: id, data: { candidate: e.candidate } });
+    };
+    pc.onconnectionstatechange = function () {
+      if (pc.connectionState === 'failed') closePeer(id);
+    };
+
+    var offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    send({ type: 'signal', to: id, data: { sdp: pc.localDescription } });
+    tuneSenders(pc);
+  }
+
+  async function presenterSignal(from, d) {
+    var pc = peers[from];
+    if (!pc || !d) return;
+    if (d.sdp) await setRemote(pc, d.sdp);
+    else if (d.candidate) addCandidate(pc, d.candidate);
+  }
+
+  // ---- ESPECTADOR -------------------------------------------------------------
+  function startViewer() {
+    role = 'viewer';
+    setRunning(true);
+    $('video').muted = false;
+    connect(function () { send({ type: 'join', room: room(), role: 'viewer' }); });
+  }
+
+  async function viewerSignal(d) {
+    if (!d) return;
+
+    if (d.sdp) {
+      closePeer('presenter');
+      var pc = new RTCPeerConnection(ICE);
+      peers.presenter = pc;
+
+      pc.onicecandidate = function (e) {
+        if (e.candidate) send({ type: 'signal', data: { candidate: e.candidate } });
+      };
+      pc.ontrack = function (e) {
+        // Reduz o buffer de reprodução para o mínimo de latência
+        try { e.receiver.playoutDelayHint = 0; } catch (x) {}
+        try { e.receiver.jitterBufferTarget = 0; } catch (x) {}
+        $('video').srcObject = e.streams[0];
+        status('Assistindo');
+      };
+
+      await setRemote(pc, d.sdp);
+      var answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      send({ type: 'signal', data: { sdp: pc.localDescription } });
+
+    } else if (d.candidate && peers.presenter) {
+      addCandidate(peers.presenter, d.candidate);
+    }
+  }
+
+  // ---- Encerrar -------------------------------------------------------------
+  function stopAll() {
+    Object.keys(peers).forEach(closePeer);
+    if (stream) { stream.getTracks().forEach(function (t) { t.stop(); }); stream = null; }
+    if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+    $('video').srcObject = null;
+    role = null;
+    setRunning(false);
+    status('Desconectado');
+  }
+
+  // ---- Botões -----------------------------------------------------------------
+  $('btnShare').onclick = startPresenter;
+  $('btnWatch').onclick = startViewer;
+  $('btnStop').onclick = stopAll;
+  $('btnCopy').onclick = function () {
+    var link = location.origin + location.pathname + '?room=' + encodeURIComponent(room());
+    if (navigator.clipboard) navigator.clipboard.writeText(link);
+    status('Link copiado');
+  };
+})();
+</script>
+</body>
+</html>
